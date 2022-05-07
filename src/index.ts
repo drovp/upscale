@@ -257,7 +257,7 @@ const optionsSchema: OptionsSchema<Options> = [
 		name: 'scale',
 		type: 'select',
 		default: '2',
-		options: {'1': '1x', '2': '2x', '4': '4x', '8': '8x', '16': '16x', '32': '32x'},
+		options: {'2': '2x', '4': '4x', '8': '8x', '16': '16x', '32': '32x'},
 		title: 'Scale',
 		description: `Upscale level.`,
 	},
