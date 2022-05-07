@@ -7,7 +7,6 @@ import type {Payload, Options} from './';
 import {checkSaveAsPathOptions, TemplateError, saveAsPath} from '@drovp/save-as-path';
 import {ffprobe, ImageData, VideoData} from 'ffprobe-normalized';
 
-const ALLOWED_WAIFU2X_FORMATS = ['png', 'jpg', 'webp'];
 const IS_WIN = process.platform === 'win32';
 
 // Potential processor dependency payloads must be defined manually
@@ -20,10 +19,8 @@ interface Dependencies {
 type Utils = ProcessorUtils<Dependencies>;
 
 export default async (payload: Payload, utils: Utils) => {
-	const {input, options, id} = payload;
-	const {dependencies, output, log, progress, stage} = utils;
-	const dirname = Path.dirname(input.path);
-	const filename = getFilename(input.path);
+	const {input, options} = payload;
+	const {dependencies, output} = utils;
 	let outputPath: string;
 
 	// First, we check that options have a valid destination template.
@@ -40,23 +37,13 @@ export default async (payload: Payload, utils: Utils) => {
 
 	switch (meta?.type) {
 		case 'image': {
-			const tmpPath = Path.join(dirname, `${filename}-tmp${uid()}.${options.format}`);
-			await upscaleImage(meta, tmpPath, {...options, dependencies, onLog: log});
-
-			// Save as path
-			outputPath = await saveAsPath(input.path, tmpPath, options.format, options.saving);
+			let tmpPath = await image(meta, {payload, utils});
+			outputPath = await saveAsPath(input.path, tmpPath, options.image.format, options.saving);
 			break;
 		}
 
 		case 'video': {
-			const {path, container} = await upscaleVideo(meta, {
-				...options,
-				id,
-				dependencies,
-				onProgress: progress,
-				onLog: log,
-				onStage: stage,
-			});
+			const {path, container} = await video(meta, {payload, utils});
 			outputPath = await saveAsPath(input.path, path, container, options.saving);
 			break;
 		}
@@ -71,41 +58,35 @@ export default async (payload: Payload, utils: Utils) => {
 
 /**
  * Upscale a single image.
- * Destination path has to have a png, jpg, or webp extension at the end.
+ * Filename is the desired filename WITHOUT the extension, which will always be PNG.
  */
 async function upscaleImage(
-	input: Pick<ImageData, 'path' | 'type' | 'codec' | 'container'>,
-	destinationPath: string,
+	input: Pick<ImageData, 'path' | 'container'>,
+	filename: string,
 	{
 		dependencies,
-		onLog,
+		log,
 		...options
 	}: Pick<Options, 'scale' | 'denoise' | 'model' | 'tileSize' | 'gpuId' | 'loadProcSave' | 'tta'> & {
 		dependencies: Dependencies;
-		onLog: (message: string) => void;
+		log: (message: string) => void;
 	}
 ) {
 	const args: string[] = [];
 	let sourcePath = input.path;
 	const dirname = Path.dirname(input.path);
-	const outputFormat = Path.extname(destinationPath).trim().slice(1).toLowerCase();
+	const destinationPath = Path.join(dirname, `${filename}.png`);
 	const cleanups: (() => any)[] = [];
-
-	if (!ALLOWED_WAIFU2X_FORMATS.includes(outputFormat)) {
-		throw new Error(
-			`Invalid destination extension "${outputFormat}". Only ${ALLOWED_WAIFU2X_FORMATS.join(', ')} are allowed.`
-		);
-	}
 
 	// If source format is not supported by waifu2x, convert it to png
 	if (!['png', 'jpg', 'webp'].includes(input.container)) {
-		onLog(`Input type "${input.container}" is not supported as waifu2x input, converting to temporary png...`);
+		log(`Input type "${input.container}" is not supported as waifu2x input, converting to temporary png...`);
 		const filename = getFilename(input.path);
 		const tmpPath = Path.join(Path.dirname(sourcePath), `${filename}-tmp${uid()}.png`);
-		onLog(`creating: "${tmpPath}"`);
+		log(`creating: "${tmpPath}"`);
 		await execute(dependencies.ffmpeg, ['-y', '-i', sourcePath, '-c:v', 'png', '-f', 'image2', tmpPath], {
 			cwd: dirname,
-			onLog,
+			log,
 		});
 		sourcePath = tmpPath;
 		cleanups.push(() => FSP.rm(tmpPath));
@@ -121,13 +102,14 @@ async function upscaleImage(
 	if (options.tta) args.push('-x');
 
 	// Input & Output
-	args.push('-f', outputFormat);
+	args.push('-f', 'png');
 	args.push('-i', sourcePath);
 	args.push('-o', destinationPath);
 
 	try {
 		// Execute waifu2x binary
-		await execute(dependencies.waifu2x, args, {cwd: dirname, onLog});
+		await execute(dependencies.waifu2x, args, {cwd: dirname, log});
+		return destinationPath;
 	} finally {
 		// Cleanup
 		for (const step of cleanups) {
@@ -139,71 +121,133 @@ async function upscaleImage(
 }
 
 /**
+ * Upscale image input.
+ */
+async function image(input: ImageData, {payload, utils}: {payload: Payload; utils: Utils}) {
+	const {id, options} = payload;
+	const {dependencies, log} = utils;
+	const {image: imageOptions} = options;
+	const dirname = Path.dirname(input.path);
+	const filename = getFilename(input.path);
+
+	let tmpPath = await upscaleImage(input, `${filename}-tmp${id}`, {...options, ...utils});
+
+	switch (imageOptions.format) {
+		case 'jpg': {
+			log('Converting to jpg...');
+			const args: (string | number)[] = ['-y'];
+			const filterComplex: string[] = [];
+
+			// Input file
+			args.push('-i', tmpPath);
+
+			// Creates background stream to be layed below input image
+			// `-f lavfi` forces required format for following input
+			args.push('-f', 'lavfi', '-i', `color=c=${imageOptions.jpg.background}`);
+
+			// Overlay filter
+			filterComplex.push(
+				'[1:v][0:v]scale2ref[bg][image]',
+				'[bg]setsar=1[bg]',
+				'[bg][image]overlay=shortest=1,format=yuv420p[out]'
+			);
+
+			// Apply filters
+			args.push('-filter_complex', filterComplex.join(';'));
+
+			// Select out stream
+			args.push('-map', '[out]');
+
+			// Codec and quality
+			args.push('-c:v', 'mjpeg');
+			args.push('-qmin', '1'); // qscale is capped to 2 by default apparently
+			args.push('-qscale:v', imageOptions.jpg.quality, '-huffman', 'optimal');
+
+			// Output
+			const jpgPath = Path.join(dirname, `${filename}.tmp${id}`);
+			args.push('-f', 'image2');
+			args.push(jpgPath);
+
+			// Execute ffmpeg
+			await execute(dependencies.ffmpeg, args, {cwd: dirname, log});
+			await FSP.rm(tmpPath);
+			return jpgPath;
+		}
+
+		case 'webp': {
+			const args: (string | number)[] = ['-y'];
+			// Input file
+			args.push('-i', tmpPath);
+
+			// Codec and quality
+			args.push('-c:v', 'libwebp');
+			args.push('-qscale:v', imageOptions.webp.quality);
+			args.push('-compression_level', '6');
+			args.push('-preset', imageOptions.webp.preset);
+
+			// Output
+			const webpPath = Path.join(dirname, `${filename}.tmp${id}`);
+			args.push('-f', 'image2');
+			args.push(webpPath);
+
+			// Execute ffmpeg
+			await execute(dependencies.ffmpeg, args, {cwd: dirname, log});
+			await FSP.rm(tmpPath);
+			return webpPath;
+		}
+
+		default:
+			return tmpPath;
+	}
+}
+
+/**
  * Upscale a video.
  * Destination path has to have a png, jpg, or webp extension at the end.
  */
-async function upscaleVideo(
-	input: VideoData,
-	{
-		id: operationId,
-		dependencies,
-		onStage,
-		onProgress,
-		onLog,
-		video: options,
-		...imageOptions
-	}: Options & {
-		id: string;
-		dependencies: Dependencies;
-		onStage: Utils['stage'];
-		onProgress: Progress;
-		onLog: (message: string) => void;
-	}
-) {
+async function video(input: VideoData, {payload, utils}: {payload: Payload; utils: Utils}) {
+	const {id, options} = payload;
+	const {dependencies, log, progress, stage} = utils;
+	const {video: videoOptions} = options;
 	const directory = Path.dirname(input.path);
 	const filename = getFilename(input.path);
-	const inputExtension = Path.extname(input.path).trim().slice(1).toLocaleLowerCase();
-	const framesDirectory = Path.join(Path.dirname(input.path), `[FRAMES-${operationId}] ${filename}`);
+	const inputExtension = getExtension(input.path);
+	const framesDirectory = Path.join(Path.dirname(input.path), `[FRAMES-${id}] ${filename}`);
 	const cleanups: (() => any)[] = [];
 
 	// Create directory for storing frames
-	onLog(`Creating directory for storing frames at "${framesDirectory}"`);
+	log(`Creating directory for storing frames at "${framesDirectory}"`);
 	await FSP.mkdir(framesDirectory);
 	cleanups.push(async () => {
-		onLog(`Deleting frames directory...`);
+		log(`Deleting frames directory...`);
 		await FSP.rm(framesDirectory, {recursive: true, force: true});
 	});
 
 	// Extract frames
-	onStage('extracting frames');
+	stage('extracting frames');
 	await execute(dependencies.ffmpeg, ['-y', '-i', input.path, '%08d.png'], {
 		cwd: framesDirectory,
-		onLog: ffmpegProgressOrLog(onProgress, onLog),
+		log: ffmpegProgressOrLog(progress, log),
 	});
 
-	onProgress(null);
+	progress(null);
 
 	// Upscale frames
-	onStage('upscaling frames');
+	stage('upscaling frames');
 	const frameFiles = await FSP.readdir(framesDirectory);
 	for (let i = 0; i < frameFiles.length; i++) {
-		onProgress(i, frameFiles.length);
+		progress(i, frameFiles.length);
 		const file = frameFiles[i]!;
 		const filePath = Path.join(framesDirectory, file);
 		const filename = getFilename(file);
-		const x2Path = Path.join(framesDirectory, `${filename}_2x.png`);
-		await upscaleImage({path: filePath, type: 'image', codec: 'png', container: 'png'}, x2Path, {
-			...imageOptions,
-			dependencies,
-			onLog,
-		});
+		await upscaleImage({path: filePath, container: 'png'}, `${filename}_2x`, {...options, ...utils});
 		await FSP.rm(filePath);
 	}
 
-	onProgress(null);
+	progress(null);
 
 	try {
-		onStage('encoding video');
+		stage('encoding video');
 
 		const inputArgs: (string | number)[] = [];
 		const videoArgs: (string | number)[] = [];
@@ -219,16 +263,16 @@ async function upscaleVideo(
 					: 'webm'
 				: input.container;
 		const outputContainer =
-			hasSubtitles && options.ensureSubtitles
+			hasSubtitles && videoOptions.ensureSubtitles
 				? 'mkv'
-				: options.inheritContainer && ['mp4', 'webm', 'mkv', 'gif'].includes(inputContainer)
+				: videoOptions.inheritContainer && ['mp4', 'webm', 'mkv', 'gif'].includes(inputContainer)
 				? (inputContainer as 'mp4' | 'webm' | 'mkv' | 'gif')
-				: options.preferredContainer;
+				: videoOptions.preferredContainer;
 		const outputFormat = outputContainer === 'mkv' ? 'matroska' : outputContainer;
 		const outputCodec = {
-			mp4: options.mp4Codec,
-			webm: options.webmCodec,
-			mkv: options.mkvCodec,
+			mp4: videoOptions.mp4Codec,
+			webm: videoOptions.webmCodec,
+			mkv: videoOptions.mkvCodec,
 			gif: 'gif' as const,
 		}[outputContainer];
 		let twoPass: false | TwoPassData = false;
@@ -252,78 +296,78 @@ async function upscaleVideo(
 		const filters: string[] = [];
 
 		// Set pixel format, ignored for gif or it removes transparency
-		if (outputContainer !== 'gif') filters.push(`format=${options.pixelFormat}`);
+		if (outputContainer !== 'gif') filters.push(`format=${videoOptions.pixelFormat}`);
 
 		// Codec specific args
 		switch (outputCodec) {
 			case 'h264':
 				videoArgs.push('-c:v', 'libx264');
-				videoArgs.push('-preset', options.h264.preset);
-				if (options.h264.tune) videoArgs.push('-tune', options.h264.tune);
-				if (options.h264.profile !== 'auto') videoArgs.push('-profile', options.h264.profile);
-				videoArgs.push('-crf', options.h264.crf);
+				videoArgs.push('-preset', videoOptions.h264.preset);
+				if (videoOptions.h264.tune) videoArgs.push('-tune', videoOptions.h264.tune);
+				if (videoOptions.h264.profile !== 'auto') videoArgs.push('-profile', videoOptions.h264.profile);
+				videoArgs.push('-crf', videoOptions.h264.crf);
 				break;
 
 			case 'h265':
 				videoArgs.push('-c:v', 'libx265');
-				videoArgs.push('-preset', options.h265.preset);
-				if (options.h265.tune) videoArgs.push('-tune', options.h265.tune);
-				if (options.h265.profile !== 'auto') videoArgs.push('-profile', options.h265.profile);
-				videoArgs.push('-crf', options.h265.crf);
+				videoArgs.push('-preset', videoOptions.h265.preset);
+				if (videoOptions.h265.tune) videoArgs.push('-tune', videoOptions.h265.tune);
+				if (videoOptions.h265.profile !== 'auto') videoArgs.push('-profile', videoOptions.h265.profile);
+				videoArgs.push('-crf', videoOptions.h265.crf);
 				break;
 
 			case 'vp8':
 				videoArgs.push('-c:v', 'libvpx');
-				if (options.vp8.speed) videoArgs.push('-speed', options.vp8.speed);
-				videoArgs.push('-crf', options.vp8.crf);
-				videoArgs.push('-qmin', options.vp8.qmin);
-				videoArgs.push('-qmax', options.vp8.qmax);
+				if (videoOptions.vp8.speed) videoArgs.push('-speed', videoOptions.vp8.speed);
+				videoArgs.push('-crf', videoOptions.vp8.crf);
+				videoArgs.push('-qmin', videoOptions.vp8.qmin);
+				videoArgs.push('-qmax', videoOptions.vp8.qmax);
 
 				// Encoding GIFs without this fails, no idea if disabling this
 				// is bad, but definitely not as bad as errors.
 				videoArgs.push('-auto-alt-ref', 0);
 
-				if (options.vp8.twoPass) twoPass = makeTwoPass(operationId);
+				if (videoOptions.vp8.twoPass) twoPass = makeTwoPass(id);
 
 				break;
 
 			case 'vp9':
 				videoArgs.push('-c:v', 'libvpx-vp9');
 				videoArgs.push('-quality', 'good');
-				videoArgs.push('-crf', options.vp9.crf, '-b:v', 0);
-				videoArgs.push('-qmin', options.vp9.qmin);
-				videoArgs.push('-qmax', options.vp9.qmax);
+				videoArgs.push('-crf', videoOptions.vp9.crf, '-b:v', 0);
+				videoArgs.push('-qmin', videoOptions.vp9.qmin);
+				videoArgs.push('-qmax', videoOptions.vp9.qmax);
 
 				// Multithreading
-				if (options.vp9.threads > 1) {
-					videoArgs.push('-threads', options.vp9.threads);
-					videoArgs.push('-tile-columns', options.vp9.threads);
+				if (videoOptions.vp9.threads > 1) {
+					videoArgs.push('-threads', videoOptions.vp9.threads);
+					videoArgs.push('-tile-columns', videoOptions.vp9.threads);
 				}
 
-				if (options.vp9.twoPass) {
-					twoPass = makeTwoPass(operationId);
+				if (videoOptions.vp9.twoPass) {
+					twoPass = makeTwoPass(id);
 					twoPass.args[0].push('-speed', 4);
-					twoPass.args[1].push('-speed', options.vp9.speed);
+					twoPass.args[1].push('-speed', videoOptions.vp9.speed);
 				} else {
-					videoArgs.push('-speed', options.vp9.speed);
+					videoArgs.push('-speed', videoOptions.vp9.speed);
 				}
 
 				break;
 
 			case 'av1':
 				videoArgs.push('-c:v', 'libaom-av1');
-				videoArgs.push('-crf', options.av1.crf, '-b:v', 0);
-				videoArgs.push('-qmin', options.av1.qmin);
-				videoArgs.push('-qmax', options.av1.qmax);
+				videoArgs.push('-crf', videoOptions.av1.crf, '-b:v', 0);
+				videoArgs.push('-qmin', videoOptions.av1.qmin);
+				videoArgs.push('-qmax', videoOptions.av1.qmax);
 
 				// Max keyframe interval
-				if (options.av1.maxKeyframeInterval) {
-					videoArgs.push('-g', Math.round(input.framerate * options.av1.maxKeyframeInterval));
+				if (videoOptions.av1.maxKeyframeInterval) {
+					videoArgs.push('-g', Math.round(input.framerate * videoOptions.av1.maxKeyframeInterval));
 				}
 
-				videoArgs.push('-cpu-used', options.av1.speed);
-				if (options.av1.multithreading) videoArgs.push('-row-mt', 1);
-				if (options.av1.twoPass) twoPass = makeTwoPass(operationId);
+				videoArgs.push('-cpu-used', videoOptions.av1.speed);
+				if (videoOptions.av1.multithreading) videoArgs.push('-row-mt', 1);
+				if (videoOptions.av1.twoPass) twoPass = makeTwoPass(id);
 
 				break;
 
@@ -331,9 +375,9 @@ async function upscaleVideo(
 				filters.push(
 					[
 						`split[o1][o2]`,
-						`[o1]palettegen=max_colors=${options.gif.colors}[p]`,
+						`[o1]palettegen=max_colors=${videoOptions.gif.colors}[p]`,
 						`[o2]fifo[o3]`,
-						`[o3][p]paletteuse=dither=${options.gif.dithering}`,
+						`[o3][p]paletteuse=dither=${videoOptions.gif.dithering}`,
 					].join(';')
 				);
 				break;
@@ -351,7 +395,7 @@ async function upscaleVideo(
 
 				// Set audio bitrate for each stream
 				for (const [index, audioChannel] of input.audioStreams.entries()) {
-					audioArgs.push(`-b:a:${index}`, `${options.audioChannelBitrate * audioChannel.channels}k`);
+					audioArgs.push(`-b:a:${index}`, `${videoOptions.audioChannelBitrate * audioChannel.channels}k`);
 				}
 			}
 		}
@@ -360,41 +404,41 @@ async function upscaleVideo(
 		if (twoPass) {
 			const {logFiles} = twoPass;
 			cleanups.push(async () => {
-				onLog(`Deleting 2 pass log files...`);
+				log(`Deleting 2 pass log files...`);
 				for (const path of logFiles) {
 					try {
-						onLog(`→ "${path}"`);
+						log(`→ "${path}"`);
 						await FSP.rm(path, {recursive: true, force: true});
 					} catch {}
 				}
 			});
-			onStage('pass 1');
+			stage('pass 1');
 
 			// First pass to null with no audio
 			await execute(
 				dependencies.ffmpeg,
 				[...inputArgs, ...videoArgs, ...twoPass.args[0], '-an', '-f', 'null', IS_WIN ? 'NUL' : '/dev/null'],
-				{cwd: directory, onLog: ffmpegProgressOrLog(onProgress, onLog)}
+				{cwd: directory, log: ffmpegProgressOrLog(progress, log)}
 			);
 
 			// Enable second pass for final encode
 			outputArgs.push(...twoPass.args[1]);
-			onStage('pass 2');
+			stage('pass 2');
 		}
 
 		// Enforce output type
 		outputArgs.push('-f', outputFormat);
 
 		// Finally, encode the file
-		const tmpPath = Path.join(directory, `${filename}.tmp${operationId}`);
+		const tmpPath = Path.join(directory, `${filename}.tmp${id}`);
 		await execute(dependencies.ffmpeg, [...inputArgs, ...videoArgs, ...audioArgs, ...outputArgs, tmpPath], {
 			cwd: directory,
-			onLog: ffmpegProgressOrLog(onProgress, onLog),
+			log: ffmpegProgressOrLog(progress, log),
 		});
 
 		return {path: tmpPath, container: outputContainer};
 	} finally {
-		onStage('cleaning up');
+		stage('cleaning up');
 		// Cleanup
 		for (const step of cleanups) {
 			try {
@@ -407,12 +451,12 @@ async function upscaleVideo(
 function execute(
 	binPath: string,
 	args: (string | number)[],
-	{onLog, cwd}: {onLog?: (message: string) => void; cwd?: string} = {}
+	{log, cwd}: {log?: (message: string) => void; cwd?: string} = {}
 ) {
 	return new Promise<void>((resolve, reject) => {
 		const finalArgs = args.map(toString);
 
-		onLog?.(`Executing binary:
+		log?.(`Executing binary:
 ----------------------------------------
 → bin: "${binPath}"
 → params: ${finalArgs.map(argToParam).join(' ')}
@@ -426,12 +470,12 @@ function execute(
 		cp.stdout.on('data', (data: Buffer) => {
 			const message = data.toString();
 			stdout += message;
-			onLog?.(message);
+			log?.(message);
 		});
 		cp.stderr.on('data', (data: Buffer) => {
 			const message = data.toString();
 			stderr += message;
-			onLog?.(message);
+			log?.(message);
 		});
 
 		let done = (err?: Error | null, code?: number | null) => {
@@ -460,6 +504,11 @@ function argToParam(value: string) {
 const toString = (value: any) => `${value}`;
 const uid = (size = 6) => Math.random().toString().slice(-size);
 const getFilename = (path: string) => Path.basename(path, Path.extname(path));
+
+function getExtension(path: string) {
+	const extname = Path.extname(path).trim().slice(1).toLocaleLowerCase();
+	return extname === 'jpeg' ? 'jpg' : extname;
+}
 
 /**
  * FFmpeg std parser that extracts progress and logs the rest.

@@ -167,7 +167,17 @@ export type Options = SaveAsOptions & {
 	tileSize: string;
 	gpuId: string;
 	loadProcSave: string;
-	format: 'jpg' | 'png' | 'webp';
+	image: {
+		format: 'jpg' | 'png' | 'webp';
+		jpg: {
+			quality: number; // 1: best, 31: worst
+			background: string;
+		};
+		webp: {
+			quality: number; // 0: worst, 100: best
+			preset: 'none' | 'default' | 'picture' | 'photo' | 'drawing' | 'icon' | 'text';
+		};
+	};
 	video: {
 		inheritContainer: boolean;
 		preferredContainer: 'mp4' | 'webm' | 'mkv';
@@ -280,14 +290,69 @@ const optionsSchema: OptionsSchema<Options> = [
 		title: 'Model',
 		description: `Waifu2x training model. <b>photo</b> retains textures &amp; grain, <b>art</b> smooths them out, and <b>cunet</b> is somewhere in the middle`,
 	},
-	{type: 'divider', title: 'Image'},
 	{
-		name: 'format',
-		type: 'select',
-		options: ['jpg', 'png', 'webp'],
-		default: 'png',
-		title: 'Output format',
-		description: `PNG and webp are lossless. PNG has better support, webp is a bit smaller.`,
+		name: 'image',
+		type: 'namespace',
+		title: 'Image',
+		description: `Input can be any image supported by ffmpeg.`,
+		schema: [
+			{
+				name: 'format',
+				type: 'select',
+				options: {jpg: 'JPG', png: 'PNG', webp: 'WEBP'},
+				default: 'png',
+				title: 'Output format',
+				description: `PNG is lossless, JPG doesn't support alpha channel, and WEBP has the best compression ratio but lowest support.`,
+			},
+			{
+				name: 'jpg',
+				type: 'namespace',
+				isHidden: (_, {image}) => image.format !== 'jpg',
+				schema: [
+					{
+						name: 'quality',
+						type: 'number',
+						min: 1,
+						max: 31,
+						step: 1,
+						default: 3,
+						title: 'Quality',
+						description: `FFmpeg's <code>jpg</code> encoder quality. 1 = best, biggest file; 31 = worst, smallest file.`,
+					},
+					{
+						name: 'background',
+						type: 'color',
+						default: 'white',
+						title: 'Background',
+						description: `Background color to use when converting from images with transparent background.<br>Format: <code>#RRGGBB</code>, or name of the color as defined <a href="https://ffmpeg.org/ffmpeg-utils.html#Color">here</a>.`,
+					},
+				],
+			},
+			{
+				name: 'webp',
+				type: 'namespace',
+				isHidden: (_, {image}) => image.format !== 'webp',
+				schema: [
+					{
+						name: 'quality',
+						type: 'number',
+						min: 1,
+						max: 100,
+						step: 1,
+						default: 80,
+						title: 'Quality',
+						description: `<code>libwebp</code> encoder quality. 1 = worst, smallest file; 100 = best, biggest file.`,
+					},
+					{
+						name: 'preset',
+						type: 'select',
+						options: ['none', 'default', 'picture', 'photo', 'drawing', 'icon', 'text'],
+						default: 'picture',
+						title: 'Preset',
+					},
+				],
+			},
+		],
 	},
 	{
 		name: 'video',
@@ -719,7 +784,7 @@ const optionsSchema: OptionsSchema<Options> = [
 			{
 				type: 'divider',
 				title: 'Audio',
-				description: `Aaudio streams are always copied without re-encoding when output container matches the input. Otherwise they are re-encoded into opus with bitrate option below.`,
+				description: `Audio streams are always copied without re-encoding when output container matches the input. Otherwise they are re-encoded into opus with bitrate option below.`,
 			},
 			{
 				name: 'audioChannelBitrate',
