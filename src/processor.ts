@@ -24,7 +24,7 @@ export default async (payload: Payload, utils: Utils) => {
 	const {dependencies, output, log, progress, stage} = utils;
 	const dirname = Path.dirname(input.path);
 	const filename = getFilename(input.path);
-	let tmpPath: string;
+	let outputPath: string;
 
 	// First, we check that options have a valid destination template.
 	try {
@@ -38,17 +38,18 @@ export default async (payload: Payload, utils: Utils) => {
 
 	const meta = await ffprobe(input.path, {path: dependencies.ffprobe});
 
-	console.log(meta);
-
 	switch (meta?.type) {
 		case 'image': {
-			tmpPath = Path.join(dirname, `${filename}-tmp${uid()}.${options.format}`);
+			const tmpPath = Path.join(dirname, `${filename}-tmp${uid()}.${options.format}`);
 			await upscaleImage(meta, tmpPath, {...options, dependencies, onLog: log});
+
+			// Save as path
+			outputPath = await saveAsPath(input.path, tmpPath, options.format, options.saving);
 			break;
 		}
 
 		case 'video': {
-			tmpPath = await upscaleVideo(meta, {
+			const {path, container} = await upscaleVideo(meta, {
 				...options,
 				id,
 				dependencies,
@@ -56,15 +57,13 @@ export default async (payload: Payload, utils: Utils) => {
 				onLog: log,
 				onStage: stage,
 			});
+			outputPath = await saveAsPath(input.path, path, container, options.saving);
 			break;
 		}
 
 		default:
 			throw new Error(`Unsupported file type.`);
 	}
-
-	// Save as path
-	const outputPath = await saveAsPath(input.path, tmpPath, options.format, options.saving);
 
 	// We emit a new file
 	utils.output.file(outputPath);
@@ -163,6 +162,7 @@ async function upscaleVideo(
 ) {
 	const directory = Path.dirname(input.path);
 	const filename = getFilename(input.path);
+	const inputExtension = Path.extname(input.path).trim().slice(1).toLocaleLowerCase();
 	const framesDirectory = Path.join(Path.dirname(input.path), `[FRAMES-${operationId}] ${filename}`);
 	const cleanups: (() => any)[] = [];
 
@@ -209,12 +209,21 @@ async function upscaleVideo(
 		const videoArgs: (string | number)[] = [];
 		const audioArgs: (string | number)[] = [];
 		const outputArgs: (string | number)[] = [];
-		const includeSubtitles = input.subtitlesStreams.length > 0 && options.keepSubtitles;
-		const outputContainer = includeSubtitles
-			? 'mkv'
-			: ['mp4', 'webm', 'mkv', 'gif'].includes(input.container)
-			? (input.container as 'mp4' | 'webm' | 'mkv' | 'gif')
-			: options.preferredContainer;
+		const hasSubtitles = input.subtitlesStreams.length > 0;
+		const inputContainer =
+			// This container ID is shared between mkv and webm, so we need to
+			// normalize it further.
+			input.container === 'matroska,webm'
+				? inputExtension === 'mkv' || hasSubtitles
+					? 'mkv'
+					: 'webm'
+				: input.container;
+		const outputContainer =
+			hasSubtitles && options.ensureSubtitles
+				? 'mkv'
+				: options.inheritContainer && ['mp4', 'webm', 'mkv', 'gif'].includes(inputContainer)
+				? (inputContainer as 'mp4' | 'webm' | 'mkv' | 'gif')
+				: options.preferredContainer;
 		const outputFormat = outputContainer === 'mkv' ? 'matroska' : outputContainer;
 		const outputCodec = {
 			mp4: options.mp4Codec,
@@ -222,17 +231,19 @@ async function upscaleVideo(
 			mkv: options.mkvCodec,
 			gif: 'gif' as const,
 		}[outputContainer];
-		let twoPass: false | TwoPassData = false; // [param_name, 1st_pass_toggle, 2nd_pass_toggle]
+		let twoPass: false | TwoPassData = false;
 
 		// Input
 		inputArgs.push('-r', input.framerate);
 		inputArgs.push('-i', input.path);
+		inputArgs.push('-r', input.framerate);
 		inputArgs.push('-i', `${framesDirectory}/%08d_2x.png`);
+		inputArgs.push('-r', input.framerate);
 
 		// Streams
 		inputArgs.push('-map', '1:v:0');
 		inputArgs.push('-map', '0:a?');
-		if (includeSubtitles) {
+		if (hasSubtitles && outputContainer === 'mkv') {
 			inputArgs.push('-map', '0:s?');
 			inputArgs.push('-map', '0:t?');
 		}
@@ -375,13 +386,13 @@ async function upscaleVideo(
 		outputArgs.push('-f', outputFormat);
 
 		// Finally, encode the file
-		const tmpPath = `${filename}.tmp${operationId}`;
+		const tmpPath = Path.join(directory, `${filename}.tmp${operationId}`);
 		await execute(dependencies.ffmpeg, [...inputArgs, ...videoArgs, ...audioArgs, ...outputArgs, tmpPath], {
 			cwd: directory,
 			onLog: ffmpegProgressOrLog(onProgress, onLog),
 		});
 
-		return tmpPath;
+		return {path: tmpPath, container: outputContainer};
 	} finally {
 		onStage('cleaning up');
 		// Cleanup
@@ -517,7 +528,7 @@ export interface TwoPassData {
  * Returns parameter pairs to enable 2 pass encoding.
  */
 function makeTwoPass(id: string, extraArgs?: (string | number)[]): TwoPassData {
-	const twoPassLogFileId = Path.join(OS.tmpdir(), `drovp-encode-passlogfile-${id}`);
+	const twoPassLogFileId = Path.join(OS.tmpdir(), `drovp-upscale-passlogfile-${id}`);
 	return {
 		args: [
 			['-pass', 1, '-passlogfile', twoPassLogFileId, ...(extraArgs || [])],
