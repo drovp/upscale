@@ -8,6 +8,12 @@ NOTE: If you're getting GPU related or any errors at all, try setting the **GPU 
 
 ## Changelog
 
+### 2.0.0
+
+- Added support for upscaling video.
+- Added support for more input image types. Before you could drop only `jpg`, `webp`, and `png` files, now you can also drop anything that ffmpeg understands, which is pretty much almost everything.
+- Added quality control for `jpg` and `webm` output formats.
+
 ### 1.0.0
 
 -   Initial release.
