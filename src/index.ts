@@ -1,3 +1,4 @@
+import * as CP from 'child_process';
 import * as Path from 'path';
 import {promises as FSP, constants as FSC} from 'fs';
 import {
@@ -159,7 +160,7 @@ async function installRelease(
 }
 
 // Expected options object
-type Options = SaveAsOptions & {
+export type Options = SaveAsOptions & {
 	format: 'jpg' | 'png' | 'webp';
 	scale: string;
 	denoise: string;
@@ -168,6 +169,93 @@ type Options = SaveAsOptions & {
 	tileSize: string;
 	gpuId: string;
 	loadProcSave: string;
+	video: {
+		inheritContainer: boolean;
+		preferredContainer: 'mp4' | 'webm' | 'mkv';
+		keepSubtitles: boolean; // if there are subs, forces container to be mkv
+
+		mp4Codec: 'h264' | 'h265' | 'vp8' | 'vp9' | 'av1';
+		webmCodec: 'vp8' | 'vp9' | 'av1';
+		mkvCodec: 'h264' | 'h265' | 'vp8' | 'vp9' | 'av1';
+
+		h264: {
+			crf: number; // 0: lossless, 51: worst
+			preset:
+				| 'ultrafast'
+				| 'superfast'
+				| 'veryfast'
+				| 'faster'
+				| 'fast'
+				| 'medium'
+				| 'slow'
+				| 'slower'
+				| 'veryslow';
+			tune: '' | 'film' | 'animation' | 'grain' | 'stillimage' | 'fastdecode' | 'zerolatency';
+			profile: 'auto' | 'baseline' | 'main' | 'high';
+		};
+
+		h265: {
+			crf: number; // 0: lossless, 51: worst
+			preset:
+				| 'ultrafast'
+				| 'superfast'
+				| 'veryfast'
+				| 'faster'
+				| 'fast'
+				| 'medium'
+				| 'slow'
+				| 'slower'
+				| 'veryslow';
+			tune: '' | 'grain' | 'zerolatency' | 'fastdecode';
+			// prettier-ignore
+			profile: 'auto' | 'main' | 'main-intra' | 'mainstillpicture' | 'main444-8' | 'main444-intra' | 'main444-stillpicture' | 'main10' | 'main10-intra' | 'main422-10' | 'main422-10-intra' | 'main444-10' | 'main444-10-intra' | 'main12' | 'main12-intra' | 'main422-12' | 'main422-12-intra' | 'main444-12' | 'main444-12-intra';
+		};
+
+		vp8: {
+			crf: number; // 0: lossless, 63: worst
+			qmin: number; // 0-63
+			qmax: number; // qmin-63
+			speed: number; // 0: slowest/best quality, 5: fastest/worst quality
+			twoPass: boolean;
+		};
+
+		vp9: {
+			mode: 'quality' | 'constrained-quality' | 'bitrate' | 'lossless' | 'size';
+			crf: number; // 0: lossless, 63: worst
+			qmin: number; // 0-63
+			qmax: number; // qmin-63
+			bitrate: number; // KB per second per million pixels (bitrate mode)
+			minrate: number; // KB per second per million pixels (bitrate mode)
+			maxrate: number; // KB per second per million pixels (bitrate mode)
+			size: number; // target size in Mpx
+			twoPass: boolean;
+			speed: number; // 0: slowest/best quality, 5: fastest/worst quality
+			threads: number;
+		};
+
+		av1: {
+			mode: 'quality' | 'constrained-quality' | 'bitrate' | 'size';
+			crf: number; // 0: lossless, 63: worst
+			qmin: number; // 0-63
+			qmax: number; // qmin-63
+			bitrate: number; // KB per second per million pixels (bitrate mode)
+			minrate: number; // KB per second per million pixels (bitrate mode)
+			maxrate: number; // KB per second per million pixels (bitrate mode)
+			size: number; // target size in Mpx
+			maxKeyframeInterval: number;
+			twoPass: boolean;
+			speed: number; // 0: slowest/best quality, 8: fastest/worst quality
+			multithreading: boolean;
+		};
+
+		gif: {
+			colors: number;
+			dithering: 'none' | 'bayer' | 'sierra2_4a';
+		};
+
+		audioChannelBitrate: number;
+		pixelFormat: string;
+	};
 };
 
 // Options schema for the Options type above
@@ -245,7 +333,7 @@ const optionsSchema: OptionsSchema<Options> = [
 
 // Accept everything! Read documentation on how to fine tune.
 const acceptsFlags = makeAcceptsFlags<Options>()({
-	files: ['jpg', 'png', 'webp'],
+	files: true,
 });
 
 // The final payload type based on options and accept flags defined above.
@@ -261,9 +349,82 @@ export default (plugin: Plugin) => {
 	plugin.registerProcessor<Payload>('upscale', {
 		main: 'dist/processor.js',
 		description: 'Upscale images using waifu2x.',
-		dependencies: ['waifu2x'],
+		dependencies: ['waifu2x', '@drovp/ffmpeg:ffmpeg', '@drovp/ffmpeg:ffprobe'],
 		accepts: acceptsFlags,
 		threadType: ['cpu', 'gpu'],
 		options: optionsSchema,
 	});
+};
+
+/// @ts-ignore
+window.test = async () => {
+	const inputDir = Path.normalize(`F:/Downloads/in`);
+	const args: string[] = ['-y'];
+
+	// Input
+	args.push('-re');
+	args.push('-framerate', '6');
+	args.push('-f', 'image2pipe');
+	args.push('-i', 'pipe:0');
+
+	// Audio
+	// args.push('-i', Path.join(inputDir, 'a.webm'));
+
+	// Sort streams
+	// args.push('-map', '0:v:0');
+	// args.push('-map', '1:a?');
+	// args.push('-map', '1:s?');
+	// args.push('-map', '1:t?');
+
+	// Output
+
+	/*
+	// GIF
+	// prettier-ignore
+	args.push('-vf', [
+		`split[o1][o2]`,
+		`[o1]palettegen=max_colors=256[p]`,
+		`[o2]fifo[o3]`,
+		`[o3][p]paletteuse=dither=none`, // none, bayer, sierra2
+	].join(';'));
+	args.push('out.gif');
+	*/
+
+	args.push('out.mp4');
+
+	console.log(args.join(' '));
+
+	const cp = CP.spawn('E:/utils/ffmpeg', args, {cwd: inputDir});
+	cp.stdout.on('data', (data: Buffer) => {
+		console.log('stdout:', data.toString());
+	});
+	cp.stderr.on('data', (data: Buffer) => {
+		console.log('stderr:', data.toString());
+	});
+
+	let done = (err?: Error | null, code?: number | null) => {
+		done = () => {};
+		if (err) {
+			console.error(err);
+		} else if (code != null && code > 0) {
+			console.error(new Error(`Process exited with code ${code}.`));
+		} else {
+			console.log('DONE');
+		}
+	};
+
+	cp.on('error', (err) => done(err));
+	cp.on('close', (code) => done(null, code));
+
+	// const frames = ['i-0.png', 'i-1.png', 'i-2.png', 'i-3.png'];
+	const frames = ['i-0.jpg', 'i-1.jpg', 'i-2.jpg', 'i-3.jpg'];
+
+	for (const frame of frames) {
+		const path = Path.join(inputDir, frame);
+		cp.stdin.write(await FSP.readFile(path));
+		console.log('frame');
+		await new Promise((resolve) => setTimeout(resolve, 1000));
+	}
+
+	cp.stdin.end();
 };
