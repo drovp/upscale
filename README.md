@@ -1,6 +1,6 @@
 # @drovp/upscale
 
-[Drovp](https://drovp.app) plugin for upscaling images with [waifu2x](https://github.com/nagadomi/waifu2x) neural network.
+[Drovp](https://drovp.app) plugin for upscaling images and videos with [waifu2x](https://github.com/nagadomi/waifu2x) neural network.
 
 Uses [nihui/waifu2x-ncnn-vulkan](https://github.com/nihui/waifu2x-ncnn-vulkan) binaries under the hood.
 

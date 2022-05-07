@@ -1,4 +1,3 @@
-import * as CP from 'child_process';
 import * as Path from 'path';
 import {promises as FSP, constants as FSC} from 'fs';
 import {
@@ -790,7 +789,7 @@ export default (plugin: Plugin) => {
 
 	plugin.registerProcessor<Payload>('upscale', {
 		main: 'dist/processor.js',
-		description: 'Upscale images using waifu2x.',
+		description: 'Upscale images and videos using waifu2x.',
 		dependencies: ['waifu2x', '@drovp/ffmpeg:ffmpeg', '@drovp/ffmpeg:ffprobe'],
 		accepts: acceptsFlags,
 		threadType: ['cpu', 'gpu'],
