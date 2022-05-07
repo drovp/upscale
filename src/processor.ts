@@ -391,7 +391,7 @@ async function video(input: VideoData, {payload, utils}: {payload: Payload; util
 			if (input.container === outputContainer) {
 				audioArgs.push('-c:a', 'copy');
 			} else {
-				audioArgs.push('-c:a', 'libopus');
+				audioArgs.push('-c:a', videoOptions.audioCodec);
 
 				// Set audio bitrate for each stream
 				for (const [index, audioChannel] of input.audioStreams.entries()) {

@@ -254,6 +254,7 @@ export type Options = SaveAsOptions & {
 			dithering: 'none' | 'bayer' | 'sierra2_4a';
 		};
 
+		audioCodec: 'libopus' | 'libvorbis';
 		audioChannelBitrate: number;
 		pixelFormat: string;
 	};
@@ -784,7 +785,15 @@ const optionsSchema: OptionsSchema<Options> = [
 			{
 				type: 'divider',
 				title: 'Audio',
-				description: `Audio streams are always copied without re-encoding when output container matches the input. Otherwise they are re-encoded into opus with bitrate option below.`,
+				description: `Audio streams are always copied without re-encoding when output container matches the input. Otherwise they are re-encoded based on options below.`,
+			},
+			{
+				name: 'audioCodec',
+				type: 'select',
+				options: {libopus: 'Opus', libvorbis: 'Vorbis'},
+				default: 'libopus',
+				title: 'Audio codec',
+				description: `Opus is better, but Vorbis is older with slightly better support.`,
 			},
 			{
 				name: 'audioChannelBitrate',
