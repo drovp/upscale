@@ -212,11 +212,12 @@ async function video(input: VideoData, {payload, utils}: {payload: Payload; util
 	const directory = Path.dirname(input.path);
 	const filename = getFilename(input.path);
 	const inputExtension = getExtension(input.path);
-	const framesDirectory = Path.join(Path.dirname(input.path), `[FRAMES-${id}] ${filename}`);
+	const framesDirectory = Path.join(Path.dirname(input.path), `[frames-${id}] ${filename}`);
 	const cleanups: (() => any)[] = [];
 
 	// Create directory for storing frames
 	log(`Creating directory for storing frames at "${framesDirectory}"`);
+	await FSP.rm(framesDirectory, {recursive: true, force: true});
 	await FSP.mkdir(framesDirectory);
 	cleanups.push(async () => {
 		log(`Deleting frames directory...`);
