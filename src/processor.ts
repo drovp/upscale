@@ -5,7 +5,7 @@ import {spawn} from 'child_process';
 import type {ProcessorUtils, Progress} from '@drovp/types';
 import type {Payload, Options} from './';
 import {checkSaveAsPathOptions, TemplateError, saveAsPath} from '@drovp/save-as-path';
-import {ffprobe, ImageData, VideoData} from 'ffprobe-normalized';
+import {ffprobe, ImageMeta, VideoMeta} from 'ffprobe-normalized';
 
 const IS_WIN = process.platform === 'win32';
 
@@ -61,7 +61,7 @@ export default async (payload: Payload, utils: Utils) => {
  * Filename is the desired filename WITHOUT the extension, which will always be PNG.
  */
 async function upscaleImage(
-	input: Pick<ImageData, 'path' | 'container'>,
+	input: Pick<ImageMeta, 'path' | 'container'>,
 	filename: string,
 	{
 		dependencies,
@@ -123,7 +123,7 @@ async function upscaleImage(
 /**
  * Upscale image input.
  */
-async function image(input: ImageData, {payload, utils}: {payload: Payload; utils: Utils}) {
+async function image(input: ImageMeta, {payload, utils}: {payload: Payload; utils: Utils}) {
 	const {id, options} = payload;
 	const {dependencies, log} = utils;
 	const {image: imageOptions} = options;
@@ -205,7 +205,7 @@ async function image(input: ImageData, {payload, utils}: {payload: Payload; util
  * Upscale a video.
  * Destination path has to have a png, jpg, or webp extension at the end.
  */
-async function video(input: VideoData, {payload, utils}: {payload: Payload; utils: Utils}) {
+async function video(input: VideoMeta, {payload, utils}: {payload: Payload; utils: Utils}) {
 	const {id, options} = payload;
 	const {dependencies, log, progress, stage} = utils;
 	const {video: videoOptions} = options;

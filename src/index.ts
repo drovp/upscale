@@ -9,7 +9,7 @@ import {
 	InstallUtils,
 	DependencyData,
 } from '@drovp/types';
-import {makeOptionSchema, Options as SaveAsOptions} from '@drovp/save-as-path';
+import {makeOptionSchema as makeSavingOptionSchema, Options as SaveAsOptions} from '@drovp/save-as-path';
 
 const RELEASES_LIMIT = 10;
 const API_RELEASES_ENDPOINT = `https://api.github.com/repos/nihui/waifu2x-ncnn-vulkan/releases`;
@@ -262,7 +262,7 @@ export type Options = SaveAsOptions & {
 
 // Options schema for the Options type above
 const optionsSchema: OptionsSchema<Options> = [
-	makeOptionSchema(),
+	makeSavingOptionSchema(),
 	{
 		name: 'scale',
 		type: 'select',
