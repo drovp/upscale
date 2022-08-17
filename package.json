@@ -1,6 +1,6 @@
 {
 	"name": "@drovp/upscale",
-	"version": "2.0.2",
+	"version": "3.0.0",
 	"description": "Upscale images and videos with waifu2x neural network.",
 	"main": "dist/index.js",
 	"keywords": [
