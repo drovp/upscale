@@ -272,13 +272,14 @@ export type Options = SaveAsOptions & {
 		};
 
 		av1: {
+			preset: number; // 0-13 effort, 0: slowest, 13: fastest with quality/size tradeoff
 			crf: number; // 0: lossless, 63: worst
-			qmin: number; // 0-63
-			qmax: number; // qmin-63
-			maxKeyframeInterval: number;
+			keyframeInterval: number;
+			sceneDetection: boolean;
+			filmGrainSynthesis: number; // 0: off, 50: max de-noising and re-noising
 			twoPass: boolean;
-			speed: number; // 0: slowest/best quality, 8: fastest/worst quality
 			multithreading: boolean;
+			preferredOutputFormat: 'mkv' | 'mp4' | 'webm';
 		};
 
 		gif: {
@@ -700,71 +701,67 @@ const optionsSchema: OptionsSchema<Options> = [
 				isHidden: (_, {video}) => video.codecCategory !== 'av1',
 				schema: [
 					{
+						name: 'preset',
+						type: 'number',
+						min: 0,
+						max: 13,
+						step: 1,
+						default: 8,
+						title: 'Preset',
+						description: `Encoding effort. Higher value means faster encoding with quality/size tradeoff.`,
+					},
+					{
+						name: 'mode',
+						type: 'select',
+						options: {
+							crf: 'Constant rate factor',
+							vbr: 'Variable bitrate',
+							cbr: 'Constant bitrate',
+							size: 'Target size',
+						},
+						default: 'crf',
+						title: 'Mode',
+						description: `Rate control mode.`,
+					},
+					{
 						name: 'crf',
 						type: 'number',
 						min: 0,
 						max: 63,
 						step: 1,
-						default: 30,
+						default: 35,
 						title: 'CRF',
-						description: `Constant quality rate factor. 0 = lossless, biggest file; 63 = worst, smallest file. Value has to be between <code>qmin</code> and <code>qmax</code> below.`,
+						description: `Constant quality rate factor. 0 = lossless, biggest file; 63 = worst, smallest file.`,
 					},
 					{
-						name: 'qmin',
-						type: 'number',
-						min: 0,
-						max: 63,
-						step: 1,
-						default: 0,
-						title: 'qmin',
-						description: `The minimum range of quantizers that the rate control algorithm may use.`,
-					},
-					{
-						name: 'qmax',
-						type: 'number',
-						min: 0,
-						max: 63,
-						step: 1,
-						default: 63,
-						title: 'qmax',
-						description: `The maximum range of quantizers that the rate control algorithm may use.`,
-					},
-					{
-						name: 'maxKeyframeInterval',
+						name: 'keyframeInterval',
 						type: 'number',
 						kind: 'float',
 						min: 0,
 						max: 10,
 						softMax: true,
 						step: 0.1,
-						default: 10,
-						title: 'Max keyframe interval',
+						default: 6,
+						title: 'Keyframe interval',
 						hint: `s`,
-						description: `Set the maximum keyframe interval in seconds. Setting to 0 will use the default keyframe interval of 9999 frames, which can lead to slow seeking.`,
+						description: `Set the average keyframe interval in seconds.`,
 					},
 					{
-						name: 'twoPass',
+						name: 'sceneDetection',
 						type: 'boolean',
 						default: true,
-						title: '2 pass',
-						description: `Encodes video in 2 passes, 1st one to prepare a lookahead information so that the actual 2nd encode can do its job better. This takes longer than a simple 1 pass encode.`,
+						title: 'Scene detection',
+						description: `Forces a keyframe when encoder detects a scene change.`,
 					},
 					{
-						name: 'speed',
+						name: 'filmGrainSynthesis',
 						type: 'number',
 						min: 0,
-						max: 8,
+						max: 50,
 						step: 1,
-						default: 1,
-						title: 'Speed',
-						description: `Sets how efficient the compression will be. Lower values mean slower encoding with better quality, and vice-versa.`,
-					},
-					{
-						name: 'multithreading',
-						type: 'boolean',
-						default: true,
-						title: 'Multithreading',
-						description: `Enables row-based multi-threading which maximizes CPU usage.`,
+						default: 0,
+						title: 'Film grain synthesis',
+						description: `De-noise the video and re-add the noise during decoding to save space. Number controls the strength of the de-noising and re-noising filters. <code>0</code> means off.`,
 					},
 				],
 			},

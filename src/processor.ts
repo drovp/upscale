@@ -493,19 +493,24 @@ async function video(
 				break;
 
 			case 'av1':
-				videoArgs.push('-c:v', 'libaom-av1');
-				videoArgs.push('-crf', videoOptions.av1.crf, '-b:v', 0);
-				videoArgs.push('-qmin', videoOptions.av1.qmin);
-				videoArgs.push('-qmax', videoOptions.av1.qmax);
+				videoArgs.push('-c:v', 'libsvtav1');
 
-				// Max keyframe interval
-				if (videoOptions.av1.maxKeyframeInterval) {
-					videoArgs.push('-g', Math.round(input.framerate * videoOptions.av1.maxKeyframeInterval));
+				const svtav1Params: string[] = [];
+
+				// Preset
+				svtav1Params.push(`preset=${videoOptions.av1.preset}`);
+				svtav1Params.push(`crf=${videoOptions.av1.crf}`);
+
+				// Keyframe interval
+				svtav1Params.push(`keyint=${Math.round(input.framerate * videoOptions.av1.keyframeInterval)}`);
+				if (videoOptions.av1.sceneDetection) svtav1Params.push('scd=1');
+
+				// Film grain synthesis
+				if (videoOptions.av1.filmGrainSynthesis > 0) {
+					svtav1Params.push(`film-grain=${videoOptions.av1.filmGrainSynthesis}`);
 				}
 
-				videoArgs.push('-cpu-used', videoOptions.av1.speed);
-				if (videoOptions.av1.multithreading) videoArgs.push('-row-mt', 1);
-				if (videoOptions.av1.twoPass) twoPass = makeTwoPass(id);
+				videoArgs.push('-svtav1-params', svtav1Params.join(':'));
 
 				break;
 
