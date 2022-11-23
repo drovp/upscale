@@ -1,6 +1,6 @@
 {
 	"name": "@drovp/upscale",
-	"version": "3.0.0",
+	"version": "4.0.0",
 	"description": "Upscale images and videos with Real-ESRGAN or waifu2x neural network.",
 	"main": "dist/index.js",
 	"keywords": [
