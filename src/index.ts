@@ -11,10 +11,7 @@ import {
 } from '@drovp/types';
 import {makeOptionSchema as makeSavingOptionSchema, Options as SaveAsOptions} from '@drovp/save-as-path';
 
-const RELEASES_LIMIT = 10;
-const API_RELEASES_ENDPOINT = `https://api.github.com/repos/nihui/waifu2x-ncnn-vulkan/releases`;
 const VERSION_FILE = 'version.txt';
-const BIN = `waifu2x-ncnn-vulkan${process.platform === 'win32' ? '.exe' : ''}`;
 
 interface ReleaseData {
 	tag_name: string; // '20220419'
@@ -36,52 +33,63 @@ interface AssetData {
 	browser_download_url: string; // 'https://github.com/nihui/waifu2x-ncnn-vulkan/releases/download/20220419/waifu2x-ncnn-vulkan-20220419-macos.zip'
 }
 
-async function loadDependency(utils: LoadUtils): Promise<DependencyData<string>> {
-	const versionPath = Path.join(utils.dataPath, VERSION_FILE);
-	const binPath = Path.join(utils.dataPath, BIN);
-	const version = (await FSP.readFile(versionPath, {encoding: 'utf-8'})).trim();
+function makeLoader(id: string, binaryName: string) {
+	return async (utils: LoadUtils): Promise<DependencyData<string>> => {
+		const dependencyDirectory = Path.join(utils.dataPath, id);
+		const versionPath = Path.join(dependencyDirectory, VERSION_FILE);
+		const binPath = Path.join(dependencyDirectory, binaryName);
+		const version = (await FSP.readFile(versionPath, {encoding: 'utf-8'})).trim();
 
-	await FSP.access(binPath, FSC.X_OK);
+		await FSP.access(binPath, FSC.X_OK);
 
-	return {version, payload: binPath};
+		return {version, payload: binPath};
+	};
 }
 
-async function installDependency(utils: InstallUtils) {
-	switch (process.platform) {
-		case 'darwin':
-			await installRelease('macos', utils);
-			break;
+interface InstallerMeta {
+	repositoryId: string;
+	lookupLimit?: number;
+	isWrappedDir?: boolean; // Wether archive contains files wrapped in a single directory
+}
 
-		case 'linux':
-			await installRelease('ubuntu|linux', utils);
-			break;
-
-		case 'win32':
-			await installRelease('windows|win', utils);
-			break;
-	}
+function makeInstaller(id: string, meta: InstallerMeta) {
+	return async (utils: InstallUtils) => {
+		const platformMatchNames: Record<string, string> = {
+			darwin: 'macos',
+			linux: 'ubuntu|linux',
+			win32: 'windows|win',
+		};
+		const platformMatchName = platformMatchNames[process.platform];
+		if (platformMatchName) await installRelease(id, platformMatchName, meta, utils);
+		else throw new Error(`Unsupported platform "${process.platform}".`);
+	};
 }
 
 /**
  * Usage:
  * ```
- * await installRelease('windows', utils);
- * await installRelease('macos', utils);
- * await installRelease('ubuntu|linux', utils);
+ * await installRelease('realesrgan', 'windows', utils);
+ * await installRelease('realesrgan', 'macos', utils);
+ * await installRelease('realesrgan', 'ubuntu|linux', utils);
  * ```
  */
 async function installRelease(
+	id: string,
 	archiveSuffix: string,
+	{repositoryId, lookupLimit = 10, isWrappedDir}: InstallerMeta,
 	{dataPath, tmpPath, download, extract, fetchJson, cleanup, progress, stage, log}: InstallUtils
 ) {
-	stage('resolving');
-	log(`API: ${API_RELEASES_ENDPOINT}`);
+	const dependencyDirectory = Path.join(dataPath, id);
+	const releasesUrl = `https://api.github.com/repos/${repositoryId}/releases`;
 
-	const releases = await fetchJson<ReleaseData[]>(`${API_RELEASES_ENDPOINT}?per_page=${RELEASES_LIMIT}`, {
+	stage('resolving');
+	log(`URL: ${releasesUrl}`);
+
+	const releases = await fetchJson<ReleaseData[]>(`${releasesUrl}?per_page=${lookupLimit}`, {
 		headers: {accepts: 'application/vnd.github.v3+json'},
 	});
 
-	log(`Received ${releases.length} newest releases. Looking for the lates package for "${archiveSuffix}" suffix...`);
+	log(`Received ${releases.length} newest releases. Looking for the latest package for "${archiveSuffix}" suffix...`);
 
 	const assetRegExp = new RegExp(`-(${archiveSuffix})\\.\\w+$`, 'i');
 	let data: {version: string; url: string} | undefined;
@@ -104,13 +112,21 @@ async function installRelease(
 
 	if (!data) {
 		throw new Error(
-			`None of the ${RELEASES_LIMIT} last releases contain a package with "${archiveSuffix}" suffix.`
+			`None of the ${lookupLimit} last releases contain a "${archiveSuffix}" archive this installer could recognize.`
 		);
 	}
 
 	stage(`cleanup`);
 	log(`Cleaning up old files.`);
-	await cleanup(dataPath);
+	await cleanup(dependencyDirectory);
+
+	// Clean files by previous versions that were only installing waifu2x to root
+	// TODO: remove for next major
+	for (const file of await FSP.readdir(dataPath)) {
+		if (!['waifu2x', 'realesrgan'].includes(file)) {
+			await FSP.rm(Path.join(dataPath, file), {force: true, recursive: true});
+		}
+	}
 
 	stage('downloading');
 	log(`URL: "${data.url}"`);
@@ -120,28 +136,40 @@ async function installRelease(
 
 	progress(null);
 	const archivePath = Path.join(tmpPath, filename);
+	const extractedFilesDirectory = Path.join(tmpPath, 'extracted_files');
 
 	stage('extracting');
 	log(`ARCHIVE: "${archivePath}"`);
-	const extractedFiles = await extract(archivePath, {listDetails: true, onProgress: progress});
+	const extractedFiles = await extract(archivePath, extractedFilesDirectory, {
+		listDetails: true,
+		onProgress: progress,
+	});
 	progress(null);
 	const firstFile = extractedFiles[0];
+	let directoryWithFiles: string;
 
-	if (extractedFiles.length !== 1 || !firstFile || !firstFile.isDirectory) {
-		if (extractedFiles.length === 0) throw new Error(`Extracted archive files list is empty.`);
-		else
-			throw new Error(
-				`Unexpected archive structure:\n${extractedFiles.map(({path}) => Path.basename(path)).join('\n')}`
-			);
+	if (isWrappedDir) {
+		if (extractedFiles.length !== 1 || !firstFile || !firstFile.isDirectory) {
+			if (extractedFiles.length === 0) {
+				throw new Error(`Extracted archive files list is empty.`);
+			} else {
+				throw new Error(
+					`Unexpected archive structure:\n${extractedFiles.map(({path}) => Path.basename(path)).join('\n')}`
+				);
+			}
+		}
+		directoryWithFiles = firstFile.path;
+	} else {
+		directoryWithFiles = extractedFilesDirectory;
 	}
 
 	stage(`moving files`);
-	log(`FROM: ${firstFile.path}`);
-	log(`  TO: ${dataPath}`);
+	log(`FROM: ${directoryWithFiles}`);
+	log(`  TO: ${dependencyDirectory}`);
 
-	for (const file of await FSP.readdir(firstFile.path, {withFileTypes: true})) {
-		const fromPath = Path.join(firstFile.path, file.name);
-		const toPath = Path.join(dataPath, file.name);
+	for (const file of await FSP.readdir(directoryWithFiles, {withFileTypes: true})) {
+		const fromPath = Path.join(directoryWithFiles, file.name);
+		const toPath = Path.join(dependencyDirectory, file.name);
 		log(`→ ${file.isDirectory() ? ' [dir]' : '[file]'}: ${file.name}`);
 		await FSP.rename(fromPath, toPath);
 	}
@@ -153,16 +181,19 @@ async function installRelease(
 	stage(`versioning`);
 	log(`Creating version file "${VERSION_FILE}" containing release version "${data.version}".`);
 
-	await FSP.writeFile(Path.join(dataPath, VERSION_FILE), data.version);
+	await FSP.writeFile(Path.join(dependencyDirectory, VERSION_FILE), data.version);
 
 	log(`Done. Dependency should be installed.`);
 }
+
+const waifu2xModels = new Set(['models-cunet', 'models-upconv_7_anime_style_art_rgb', 'models-upconv_7_photo']);
+const checkIsWaifu2xModel = (name: string) => waifu2xModels.has(name);
 
 // Expected options object
 export type Options = SaveAsOptions & {
 	scale: string;
 	denoise: string;
-	model: 'models-cunet' | 'models-upconv_7_anime_style_art_rgb' | 'models-upconv_7_photo';
+	model: ModelName;
 	tta: boolean;
 	tileSize: string;
 	gpuId: string;
@@ -179,6 +210,7 @@ export type Options = SaveAsOptions & {
 		};
 	};
 	video: {
+		framesFormat: 'jpg' | 'png';
 		inheritContainer: boolean;
 		preferredContainer: 'mp4' | 'webm' | 'mkv';
 		ensureSubtitles: boolean; // if there are subs, forces container to be mkv
@@ -264,10 +296,33 @@ export type Options = SaveAsOptions & {
 const optionsSchema: OptionsSchema<Options> = [
 	makeSavingOptionSchema(),
 	{
+		name: 'model',
+		type: 'select',
+		options: {
+			'realesrgan-x4plus': 'plus (Real-ESRGAN)',
+			'realesrgan-x4plus-anime': 'plus-anime (Real-ESRGAN)',
+			'realesr-animevideov3': 'animevideov3 (Real-ESRGAN)',
+			'models-cunet': 'cunet (waifu2x)',
+			'models-upconv_7_anime_style_art_rgb': 'art (waifu2x)',
+			'models-upconv_7_photo': 'photo (waifu2x)',
+		},
+		default: 'models-cunet',
+		title: 'Model',
+		description: `<b>Real-ESRGAN:</b>
+<br><b>plus</b>: general model, smooths the textures a bit too much, slow
+<br><b>plus-anime</b>: optimized for anime images, a bit faster
+<br><b>animevideov3</b>: anime video model, fast
+<br><br><b>Waifu2x:</b>
+<br><b>cunet</b>: general images, fast-ish
+<br><b>art</b>: fast
+<br><b>photo</b>: fast
+`,
+	},
+	{
 		name: 'scale',
 		type: 'select',
 		default: '2',
-		options: {'2': '2x', '4': '4x', '8': '8x', '16': '16x', '32': '32x'},
+		options: {'2': '2x', '4': '4x'},
 		title: 'Scale',
 		description: `Upscale level.`,
 	},
@@ -277,19 +332,8 @@ const optionsSchema: OptionsSchema<Options> = [
 		options: ['-1', '0', '1', '2', '3'],
 		default: '1',
 		title: 'Denoise',
-		description: `Large value means strong denoise effect, -1 = no effect.`,
-	},
-	{
-		name: 'model',
-		type: 'select',
-		options: {
-			'models-cunet': 'cunet',
-			'models-upconv_7_anime_style_art_rgb': 'art',
-			'models-upconv_7_photo': 'photo',
-		},
-		default: 'models-cunet',
-		title: 'Model',
-		description: `Waifu2x training model. <b>photo</b> retains textures &amp; grain, <b>art</b> smooths them out, and <b>cunet</b> is somewhere in the middle`,
+		description: `Waifu2x denoising level. Large value means strong denoise effect, -1 = no effect.`,
+		isHidden: (_, {model}) => !checkIsWaifu2xModel(model),
 	},
 	{
 		name: 'image',
@@ -362,17 +406,25 @@ const optionsSchema: OptionsSchema<Options> = [
 		description: `Input can be anything FFmpeg accepts, supported output containers are <code>mp4</code>, <code>webm</code>, <code>mkv</code>, <code>gif</code>. Careful, upscaling video means saving all of its frames into lossless png files, upscaling them, and re-encoding back to a new video, which can take a considerable amount of space and time.`,
 		schema: [
 			{
+				name: 'framesFormat',
+				type: 'select',
+				default: 'png',
+				options: ['jpg', 'png'],
+				title: 'Frames format',
+				description: `What format to use when splitting video into individual frames:<br><b>jpg</b> - perceptually lossless, 5x faster (to generate frames), takes less space</br><b>png</b> - lossless, preserves alpha channel (transparency)`,
+			},
+			{
 				name: 'inheritContainer',
 				type: 'boolean',
 				default: true,
 				title: 'Inherit container',
-				description: `Will try to output video into the same container type as input (mp4 -> mp4) if it's one of the supported output containers.<br>If not supported, or this option is disabled, the <b>Preferred container</b> below will be used.`,
+				description: `Will try to output video into the same container type as input (mp4 -> mp4) if it's one of the supported output containers (mp4, webm, mkv, gif).<br>If not supported, or this option is disabled, the <b>Preferred container</b> below will be used.`,
 			},
 			{
 				name: 'preferredContainer',
 				type: 'select',
 				default: 'mp4',
-				options: ['mp4', 'webm', 'mkv'],
+				options: ['mp4', 'webm', 'mkv', 'gif'],
 				title: 'Preferred container',
 				description: `What container to default to if input doesn't match one of the supported output containers, or if <b>Inherit container</b> option is disabled.`,
 			},
@@ -387,7 +439,7 @@ const optionsSchema: OptionsSchema<Options> = [
 				name: 'mp4Codec',
 				type: 'select',
 				default: 'h264',
-				options: ['h264', 'h265', 'vp8', 'vp9', 'av1'],
+				options: ['h264', 'h265', 'vp9', 'av1'],
 				title: 'MP4 Codec',
 				description: `What video codec to use when encoding into mp4 container.`,
 			},
@@ -778,7 +830,7 @@ const optionsSchema: OptionsSchema<Options> = [
 					'yuva422p12be', 'yuva422p12le', 'yuva444p12be', 'yuva444p12le', 'nv24', 'nv42', 'vulkan', 'y210be',
 					'y210le', 'x2rgb10le', 'x2rgb10be',
 				],
-				default: 'yuv420p',
+				default: 'yuva420p',
 				title: 'Pixel format',
 				isHidden: (_, {video}) => video.codecCategory === 'gif',
 			},
@@ -857,14 +909,19 @@ export type Payload = PayloadData<Options, typeof acceptsFlags>;
 
 export default (plugin: Plugin) => {
 	plugin.registerDependency('waifu2x', {
-		load: loadDependency,
-		install: installDependency,
+		load: makeLoader('waifu2x', `waifu2x-ncnn-vulkan${process.platform === 'win32' ? '.exe' : ''}`),
+		install: makeInstaller('waifu2x', {repositoryId: 'nihui/waifu2x-ncnn-vulkan', isWrappedDir: true}),
+	});
+
+	plugin.registerDependency('realesrgan', {
+		load: makeLoader('realesrgan', `realesrgan-ncnn-vulkan${process.platform === 'win32' ? '.exe' : ''}`),
+		install: makeInstaller('realesrgan', {repositoryId: 'xinntao/Real-ESRGAN'}),
 	});
 
 	plugin.registerProcessor<Payload>('upscale', {
 		main: 'dist/processor.js',
-		description: 'Upscale images and videos using waifu2x.',
-		dependencies: ['waifu2x', '@drovp/ffmpeg:ffmpeg', '@drovp/ffmpeg:ffprobe'],
+		description: 'Upscale images and videos using real-esrgan or waifu2x.',
+		dependencies: ['realesrgan', 'waifu2x', '@drovp/ffmpeg:ffmpeg', '@drovp/ffmpeg:ffprobe'],
 		accepts: acceptsFlags,
 		threadType: ['cpu', 'gpu'],
 		options: optionsSchema,

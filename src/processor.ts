@@ -1,27 +1,34 @@
 import * as Path from 'path';
 import * as OS from 'os';
 import {promises as FSP} from 'fs';
-import {spawn} from 'child_process';
-import type {ProcessorUtils, Progress} from '@drovp/types';
-import type {Payload, Options} from './';
+import type {ProcessorUtils} from '@drovp/types';
+import type {Payload} from './';
 import {checkSaveAsPathOptions, TemplateError, saveAsPath} from '@drovp/save-as-path';
 import {ffprobe, ImageMeta, VideoMeta} from 'ffprobe-normalized';
+import {
+	eem,
+	getFilename,
+	getExtension,
+	prepareEmptyDir,
+	deletePath,
+	makeDirCloneCleaner,
+	Maid,
+	execute,
+	makeFfmpegProgressOrLogSplitter,
+} from './utils';
 
 const IS_WIN = process.platform === 'win32';
 
-// Potential processor dependency payloads must be defined manually
-interface Dependencies {
-	waifu2x: string;
-	ffmpeg: string;
-	ffprobe: string;
-}
-
 type Utils = ProcessorUtils<Dependencies>;
+
+interface UpscaleResult {
+	tmpPath: string;
+	container: string;
+}
 
 export default async (payload: Payload, utils: Utils) => {
 	const {input, options} = payload;
 	const {dependencies, output} = utils;
-	let outputPath: string;
 
 	// First, we check that options have a valid destination template.
 	try {
@@ -34,17 +41,16 @@ export default async (payload: Payload, utils: Utils) => {
 	}
 
 	const meta = await ffprobe(input.path, {path: dependencies.ffprobe});
+	let result: UpscaleResult | void;
 
 	switch (meta?.type) {
 		case 'image': {
-			let tmpPath = await image(meta, {payload, utils});
-			outputPath = await saveAsPath(input.path, tmpPath, options.image.format, options.saving);
+			result = await image(meta, {payload, utils});
 			break;
 		}
 
 		case 'video': {
-			const {path, container} = await video(meta, {payload, utils});
-			outputPath = await saveAsPath(input.path, path, container, options.saving);
+			result = await video(meta, {payload, utils});
 			break;
 		}
 
@@ -52,94 +58,166 @@ export default async (payload: Payload, utils: Utils) => {
 			throw new Error(`Unsupported file type.`);
 	}
 
-	// We emit a new file
-	utils.output.file(outputPath);
+	if (result) {
+		const {tmpPath, container} = result;
+		const outputPath = await saveAsPath(input.path, tmpPath, container, options.saving);
+		utils.output.file(outputPath);
+	}
 };
 
 /**
- * Upscale a single image.
- * Filename is the desired filename WITHOUT the extension, which will always be PNG.
+ * Spawns one of the binaries to upscale in path to out path, and report the progress along the way.
+ * Resolves with output scale, which might be different than requested (relesrgan has only 4x models).
  */
-async function upscaleImage(
-	input: Pick<ImageMeta, 'path' | 'container'>,
-	filename: string,
-	{
-		dependencies,
-		log,
-		...options
-	}: Pick<Options, 'scale' | 'denoise' | 'model' | 'tileSize' | 'gpuId' | 'loadProcSave' | 'tta'> & {
-		dependencies: Dependencies;
-		log: (message: string) => void;
-	}
-) {
+async function upscale(
+	inPath: string,
+	outPath: string,
+	format: 'png' | 'jpg',
+	{payload: {options}, utils}: {payload: Payload; utils: Utils}
+): Promise<number> {
+	let dependencyName: 'waifu2x' | 'realesrgan';
 	const args: string[] = [];
-	let sourcePath = input.path;
-	const dirname = Path.dirname(input.path);
-	const destinationPath = Path.join(dirname, `${filename}.png`);
-	const cleanups: (() => any)[] = [];
+	let scale = 1;
 
-	// If source format is not supported by waifu2x, convert it to png
-	if (!['png', 'jpg', 'webp'].includes(input.container)) {
-		log(`Input type "${input.container}" is not supported as waifu2x input, converting to temporary png...`);
-		const filename = getFilename(input.path);
-		const tmpPath = Path.join(Path.dirname(sourcePath), `${filename}-tmp${uid()}.png`);
-		log(`creating: "${tmpPath}"`);
-		await execute(dependencies.ffmpeg, ['-y', '-i', sourcePath, '-c:v', 'png', '-f', 'image2', tmpPath], {
-			cwd: dirname,
-			log,
-		});
-		sourcePath = tmpPath;
-		cleanups.push(() => FSP.rm(tmpPath));
+	utils.stage('upscaling');
+	utils.progress(null);
+
+	/**
+	 * Determine if we're upscaling a directory, and clean up & prepare destination directory.
+	 */
+	const dirMode = (await FSP.stat(inPath)).isDirectory();
+	if (dirMode) await prepareEmptyDir(outPath);
+
+	/**
+	 * Determine binary and construct arguments.
+	 */
+	switch (options.model) {
+		// waifu2x
+		case 'models-cunet':
+		case 'models-upconv_7_anime_style_art_rgb':
+		case 'models-upconv_7_photo':
+			dependencyName = 'waifu2x';
+			scale = parseInt(options.scale, 10);
+			args.push('-m', options.model, '-n', options.denoise);
+			args.push('-n', options.denoise);
+			break;
+
+		// realesrgan
+		case 'realesr-animevideov3':
+		case 'realesrgan-x4plus':
+		case 'realesrgan-x4plus-anime':
+			dependencyName = 'realesrgan';
+			scale = options.model === 'realesr-animevideov3' && `${options.scale}` === '2' ? 2 : 4;
+			args.push('-n', options.model);
+			break;
+
+		default:
+			throw new Error(`Unknown model name "${options.model}"`);
 	}
 
-	// Options
-	args.push('-s', options.scale);
-	args.push('-n', options.denoise);
-	args.push('-m', options.model);
+	args.push('-s', `${scale}`);
 	args.push('-t', options.tileSize);
 	args.push('-g', options.gpuId);
 	if (options.loadProcSave) args.push('-j', options.loadProcSave);
 	if (options.tta) args.push('-x');
+	args.push('-f', format);
+	args.push('-i', inPath, '-o', outPath);
 
-	// Input & Output
-	args.push('-f', 'png');
-	args.push('-i', sourcePath);
-	args.push('-o', destinationPath);
+	/**
+	 * Upscale.
+	 */
+	const binPath = utils.dependencies[dependencyName];
+	const dirProgressDisposer = dirMode ? makeDirCloneCleaner(inPath, outPath, {onProgress: utils.progress}) : null;
+	const logOrProgress = (data: Buffer) => {
+		const message = `${data}`;
+		const percentMatch = message.match(/\s?(?<percent>\d+(\.\d+)?)%\s?/);
+		if (percentMatch) {
+			if (!dirProgressDisposer) utils.progress(parseInt(`${percentMatch.groups?.percent}`, 10) || 0, 100);
+		} else {
+			utils.log(message);
+		}
+	};
 
 	try {
-		// Execute waifu2x binary
-		await execute(dependencies.waifu2x, args, {cwd: dirname, log});
-		return destinationPath;
+		await execute(binPath, args, {cwd: Path.dirname(inPath), onStderr: logOrProgress});
+		return scale;
 	} finally {
-		// Cleanup
-		for (const step of cleanups) {
-			try {
-				await step();
-			} catch {}
-		}
+		dirProgressDisposer?.();
 	}
 }
 
 /**
  * Upscale image input.
  */
-async function image(input: ImageMeta, {payload, utils}: {payload: Payload; utils: Utils}) {
+async function image(input: ImageMeta, context: {payload: Payload; utils: Utils}): Promise<UpscaleResult | void> {
+	const {payload, utils} = context;
 	const {id, options} = payload;
+	const outputScale = parseInt(options.scale, 10) || 2;
 	const {dependencies, log} = utils;
 	const {image: imageOptions} = options;
 	const dirname = Path.dirname(input.path);
 	const filename = getFilename(input.path);
+	let workingPath = input.path;
+	const maid = new Maid();
 
-	let tmpPath = await upscaleImage(input, `${filename}-tmp${id}`, {...options, ...utils});
+	// If source format is not supported, convert it to png
+	if (!['png', 'jpg', 'webp'].includes(input.container)) {
+		log(`Input type "${input.container}" is not supported as an input, converting to temporary png...`);
+
+		const filename = getFilename(input.path);
+		const tmpPath = Path.join(Path.dirname(workingPath), `${filename}-tmp-converted-${id}.png`);
+
+		log(`creating: "${tmpPath}"`);
+
+		try {
+			maid.task(() => deletePath(tmpPath));
+			await execute(dependencies.ffmpeg, ['-y', '-i', workingPath, '-c:v', 'png', '-f', 'image2', tmpPath], {
+				cwd: dirname,
+				onLog: log,
+			});
+			workingPath = tmpPath;
+		} catch (error) {
+			utils.output.error(`Can't convert file to png, error: ${eem(error)}`);
+			await maid.cleanup();
+			return;
+		}
+	}
+
+	let currentScale = 1;
+	let result: UpscaleResult | void;
+	let rescaleFilter: string | undefined;
+
+	try {
+		let tmpPath = Path.join(dirname, `${filename}-tmp-${id}.png`);
+		currentScale = await upscale(workingPath, tmpPath, 'png', context);
+		utils.progress(100, 100, true);
+		workingPath = tmpPath;
+		log(`current scale: ${currentScale}x`);
+	} catch (error) {
+		utils.output.error(eem(error));
+		return;
+	} finally {
+		await maid.cleanup();
+	}
+
+	log(`currentScale, outputScale:`, currentScale, outputScale);
+	if (currentScale !== outputScale) {
+		const outputWidth = Math.round(input.width * outputScale);
+		const outputHeight = Math.round(input.height * outputScale);
+		rescaleFilter = `scale=${outputWidth}:${outputHeight}:flags=lanczos:force_original_aspect_ratio=disable`;
+	}
+
+	const outPath = Path.join(dirname, `${filename}.tmp-out-${id}`);
+	let ffmpegJob: {args: string[]; container: string} | undefined;
 
 	switch (imageOptions.format) {
 		case 'jpg': {
 			log('Converting to jpg...');
-			const args: (string | number)[] = ['-y'];
+			const args: string[] = [];
 			const filterComplex: string[] = [];
 
 			// Input file
-			args.push('-i', tmpPath);
+			args.push('-i', workingPath);
 
 			// Creates background stream to be layed below input image
 			// `-f lavfi` forces required format for following input
@@ -149,8 +227,13 @@ async function image(input: ImageMeta, {payload, utils}: {payload: Payload; util
 			filterComplex.push(
 				'[1:v][0:v]scale2ref[bg][image]',
 				'[bg]setsar=1[bg]',
-				'[bg][image]overlay=shortest=1,format=yuv420p[out]'
+				`[bg][image]overlay=shortest=1,format=yuv420p[${rescaleFilter ? 'prescaled' : 'out'}]`
 			);
+
+			if (rescaleFilter) {
+				log(`downscaling to: ${outputScale}x`);
+				filterComplex.push(`[prescaled]${rescaleFilter}[out]`);
+			}
 
 			// Apply filters
 			args.push('-filter_complex', filterComplex.join(';'));
@@ -161,88 +244,149 @@ async function image(input: ImageMeta, {payload, utils}: {payload: Payload; util
 			// Codec and quality
 			args.push('-c:v', 'mjpeg');
 			args.push('-qmin', '1'); // qscale is capped to 2 by default apparently
-			args.push('-qscale:v', imageOptions.jpg.quality, '-huffman', 'optimal');
+			args.push('-qscale:v', `${imageOptions.jpg.quality}`, '-huffman', 'optimal');
 
 			// Output
-			const jpgPath = Path.join(dirname, `${filename}.tmp${id}`);
 			args.push('-f', 'image2');
-			args.push(jpgPath);
+			args.push(outPath);
 
-			// Execute ffmpeg
-			await execute(dependencies.ffmpeg, args, {cwd: dirname, log});
-			await FSP.rm(tmpPath);
-			return jpgPath;
+			ffmpegJob = {args, container: 'jpg'};
+
+			break;
 		}
 
 		case 'webp': {
-			const args: (string | number)[] = ['-y'];
+			log('Converting to webp...');
+			const args: string[] = [];
+
 			// Input file
-			args.push('-i', tmpPath);
+			args.push('-i', workingPath);
+
+			if (rescaleFilter) {
+				log(`downscaling to: ${outputScale}x`);
+				args.push('-vf', rescaleFilter);
+			}
 
 			// Codec and quality
 			args.push('-c:v', 'libwebp');
-			args.push('-qscale:v', imageOptions.webp.quality);
+			args.push('-qscale:v', `${imageOptions.webp.quality}`);
 			args.push('-compression_level', '6');
 			args.push('-preset', imageOptions.webp.preset);
 
 			// Output
-			const webpPath = Path.join(dirname, `${filename}.tmp${id}`);
-			args.push('-f', 'image2');
-			args.push(webpPath);
+			args.push('-f', 'image2', outPath);
 
-			// Execute ffmpeg
-			await execute(dependencies.ffmpeg, args, {cwd: dirname, log});
-			await FSP.rm(tmpPath);
-			return webpPath;
+			ffmpegJob = {args, container: 'webp'};
+
+			break;
 		}
 
-		default:
-			return tmpPath;
+		default: {
+			if (rescaleFilter) {
+				log(`downscaling to: ${outputScale}x`);
+				const args: string[] = [];
+
+				// Input file
+				args.push('-i', workingPath);
+				args.push('-filter_complex', `[0:v]${rescaleFilter}[out]`);
+				args.push('-map', '[out]');
+				args.push('-c:v', 'png');
+
+				// Output
+				args.push('-f', 'image2', outPath);
+
+				ffmpegJob = {args, container: 'png'};
+			}
+		}
 	}
+
+	if (ffmpegJob) {
+		// Execute ffmpeg
+		try {
+			await execute(dependencies.ffmpeg, ['-y', ...ffmpegJob.args], {cwd: dirname, onLog: log});
+			await deletePath(workingPath);
+			result = {tmpPath: outPath, container: ffmpegJob.container};
+		} catch (error) {
+			utils.output.error(eem(error));
+			maid.task(() => deletePath(outPath));
+		}
+	} else {
+		result = {tmpPath: workingPath, container: 'png'};
+	}
+
+	await maid.cleanup();
+
+	return result;
 }
 
 /**
  * Upscale a video.
  * Destination path has to have a png, jpg, or webp extension at the end.
  */
-async function video(input: VideoMeta, {payload, utils}: {payload: Payload; utils: Utils}) {
+async function video(
+	input: VideoMeta,
+	{payload, utils}: {payload: Payload; utils: Utils}
+): Promise<UpscaleResult | void> {
 	const {id, options} = payload;
+	const outputScale = parseInt(options.scale, 10) || 2;
 	const {dependencies, log, progress, stage} = utils;
 	const {video: videoOptions} = options;
 	const directory = Path.dirname(input.path);
 	const filename = getFilename(input.path);
 	const inputExtension = getExtension(input.path);
-	const framesDirectory = Path.join(Path.dirname(input.path), `[frames-${id}] ${filename}`);
-	const cleanups: (() => any)[] = [];
+	const framesDirectory = Path.join(Path.dirname(input.path), `[frames-${id}]`);
+	const framesInDirectory = Path.join(framesDirectory, `in`);
+	const framesOutDirectory = Path.join(framesDirectory, `out`);
+	const maid = new Maid();
 
 	// Create directory for storing frames
-	log(`Creating directory for storing frames at "${framesDirectory}"`);
-	await FSP.rm(framesDirectory, {recursive: true, force: true});
-	await FSP.mkdir(framesDirectory);
-	cleanups.push(async () => {
+	log(`Creating directories for storing frames...\n IN: "${framesInDirectory}"\nOUT: "${framesInDirectory}"`);
+	await prepareEmptyDir(framesInDirectory);
+	await prepareEmptyDir(framesOutDirectory);
+	maid.task(async () => {
 		log(`Deleting frames directory...`);
-		await FSP.rm(framesDirectory, {recursive: true, force: true});
+		await deletePath(framesDirectory);
 	});
 
 	// Extract frames
 	stage('extracting frames');
-	await execute(dependencies.ffmpeg, ['-y', '-i', input.path, '%08d.png'], {
-		cwd: framesDirectory,
-		log: ffmpegProgressOrLog(progress, log),
-	});
+	const frameExtractionCodecArgs =
+		videoOptions.framesFormat === 'jpg'
+			? ['-c:v', 'mjpeg', '-q:v', '1', '-qmin', '1', '-qmax', '1']
+			: ['-c:v', 'png'];
+	const frameFileTemplate = `%08d.${videoOptions.framesFormat}`;
+	try {
+		await execute(dependencies.ffmpeg, ['-y', '-i', input.path, ...frameExtractionCodecArgs, frameFileTemplate], {
+			cwd: framesInDirectory,
+			onLog: makeFfmpegProgressOrLogSplitter(progress, log),
+		});
+	} catch (error) {
+		utils.output.error(`Couldn't extract frames from video. See logs for more details.`);
+		await maid.cleanup();
+		return;
+	}
 
 	progress(null);
 
+	let currentScale = 1;
+	let rescaleFilter: string | undefined;
+
 	// Upscale frames
-	stage('upscaling frames');
-	const frameFiles = await FSP.readdir(framesDirectory);
-	for (let i = 0; i < frameFiles.length; i++) {
-		progress(i, frameFiles.length);
-		const file = frameFiles[i]!;
-		const filePath = Path.join(framesDirectory, file);
-		const filename = getFilename(file);
-		await upscaleImage({path: filePath, container: 'png'}, `${filename}_2x`, {...options, ...utils});
-		await FSP.rm(filePath);
+	try {
+		currentScale = await upscale(framesInDirectory, framesOutDirectory, videoOptions.framesFormat, {
+			payload,
+			utils,
+		});
+	} catch (error) {
+		utils.output.error(`Upscaling frames failed. See logs for more details.`);
+		await maid.cleanup();
+		return;
+	}
+
+	if (currentScale !== outputScale) {
+		const outputWidth = Math.round((input.width * outputScale) / 2) * 2;
+		const outputHeight = Math.round((input.height * outputScale) / 2) * 2;
+		rescaleFilter = `scale=${outputWidth}:${outputHeight}:flags=lanczos:force_original_aspect_ratio=disable`;
 	}
 
 	progress(null);
@@ -282,22 +426,15 @@ async function video(input: VideoMeta, {payload, utils}: {payload: Payload; util
 		inputArgs.push('-r', input.framerate);
 		inputArgs.push('-i', input.path);
 		inputArgs.push('-r', input.framerate);
-		inputArgs.push('-i', `${framesDirectory}/%08d_2x.png`);
+		inputArgs.push('-i', Path.join(framesOutDirectory, frameFileTemplate));
 		inputArgs.push('-r', input.framerate);
 
-		// Streams
-		inputArgs.push('-map', '1:v:0');
-		inputArgs.push('-map', '0:a?');
-		if (hasSubtitles && outputContainer === 'mkv') {
-			inputArgs.push('-map', '0:s?');
-			inputArgs.push('-map', '0:t?');
-		}
-
 		// Filters
-		const filters: string[] = [];
+		const filters: string[] = ['yadif=deint=interlaced'];
 
-		// Set pixel format, ignored for gif or it removes transparency
-		if (outputContainer !== 'gif') filters.push(`format=${videoOptions.pixelFormat}`);
+		// Set pixel format, forced to yuva420p for gif or it removes transparency
+		filters.push(`format=${outputContainer !== 'gif' ? 'yuva420p' : videoOptions.pixelFormat}`);
+		if (rescaleFilter) filters.push(rescaleFilter);
 
 		// Codec specific args
 		switch (outputCodec) {
@@ -385,7 +522,15 @@ async function video(input: VideoMeta, {payload, utils}: {payload: Payload; util
 		}
 
 		// Apply filters
-		if (filters.length > 0) videoArgs.push('-vf', `${filters.join(',')}`);
+		videoArgs.push('-filter_complex', `[1:v:0]${filters.join(',')}[out]`);
+
+		// Streams
+		inputArgs.push('-map', '[out]');
+		if (input.audioStreams.length > 0) inputArgs.push('-map', '0:a?');
+		if (hasSubtitles && outputContainer === 'mkv') {
+			inputArgs.push('-map', '0:s?');
+			inputArgs.push('-map', '0:t?');
+		}
 
 		// Audio
 		if (input.audioStreams.length > 0 && outputContainer !== 'gif') {
@@ -404,7 +549,7 @@ async function video(input: VideoMeta, {payload, utils}: {payload: Payload; util
 		// Two pass encoding
 		if (twoPass) {
 			const {logFiles} = twoPass;
-			cleanups.push(async () => {
+			maid.task(async () => {
 				log(`Deleting 2 pass log files...`);
 				for (const path of logFiles) {
 					try {
@@ -416,11 +561,16 @@ async function video(input: VideoMeta, {payload, utils}: {payload: Payload; util
 			stage('pass 1');
 
 			// First pass to null with no audio
-			await execute(
-				dependencies.ffmpeg,
-				[...inputArgs, ...videoArgs, ...twoPass.args[0], '-an', '-f', 'null', IS_WIN ? 'NUL' : '/dev/null'],
-				{cwd: directory, log: ffmpegProgressOrLog(progress, log)}
-			);
+			try {
+				await execute(
+					dependencies.ffmpeg,
+					[...inputArgs, ...videoArgs, ...twoPass.args[0], '-an', '-f', 'null', IS_WIN ? 'NUL' : '/dev/null'],
+					{cwd: directory, onLog: makeFfmpegProgressOrLogSplitter(progress, log)}
+				);
+			} catch (error) {
+				utils.output.error(`1st encoding pass failed. See logs for more details.`);
+				return;
+			}
 
 			// Enable second pass for final encode
 			outputArgs.push(...twoPass.args[1]);
@@ -432,141 +582,24 @@ async function video(input: VideoMeta, {payload, utils}: {payload: Payload; util
 
 		// Finally, encode the file
 		const tmpPath = Path.join(directory, `${filename}.tmp${id}`);
-		await execute(dependencies.ffmpeg, [...inputArgs, ...videoArgs, ...audioArgs, ...outputArgs, tmpPath], {
-			cwd: directory,
-			log: ffmpegProgressOrLog(progress, log),
-		});
-
-		return {path: tmpPath, container: outputContainer};
+		try {
+			await execute(
+				dependencies.ffmpeg,
+				['-y', '-loglevel', 'verbose', ...inputArgs, ...videoArgs, ...audioArgs, ...outputArgs, tmpPath],
+				{
+					cwd: directory,
+					onLog: makeFfmpegProgressOrLogSplitter(progress, log),
+				}
+			);
+			return {tmpPath: tmpPath, container: outputContainer};
+		} catch (error) {
+			maid.task(() => deletePath(tmpPath));
+			utils.output.error(`Encoding failed. See logs for more details.`);
+		}
 	} finally {
 		stage('cleaning up');
-		// Cleanup
-		for (const step of cleanups) {
-			try {
-				await step();
-			} catch {}
-		}
+		await maid.cleanup();
 	}
-}
-
-function execute(
-	binPath: string,
-	args: (string | number)[],
-	{log, cwd}: {log?: (message: string) => void; cwd?: string} = {}
-) {
-	return new Promise<void>((resolve, reject) => {
-		const finalArgs = args.map(toString);
-
-		log?.(`Executing binary:
-----------------------------------------
-→ bin: "${binPath}"
-→ params: ${finalArgs.map(argToParam).join(' ')}
-→ cwd: "${cwd}"
-----------------------------------------`);
-
-		const cp = spawn(binPath, finalArgs, {cwd});
-		let stdout = '';
-		let stderr = '';
-
-		cp.stdout.on('data', (data: Buffer) => {
-			const message = data.toString();
-			stdout += message;
-			log?.(message);
-		});
-		cp.stderr.on('data', (data: Buffer) => {
-			const message = data.toString();
-			stderr += message;
-			log?.(message);
-		});
-
-		let done = (err?: Error | null, code?: number | null) => {
-			done = () => {};
-			if (err) {
-				reject(err);
-			} else if (code != null && code > 0) {
-				reject(new Error(`Process exited with code ${code}.\n\n${stderr || stdout}`));
-			} else {
-				resolve();
-			}
-		};
-
-		cp.on('error', (err) => done(err));
-		cp.on('close', (code) => done(null, code));
-	});
-}
-
-/**
- * Helper to converts params into strings as they'd be seen when uses in a console.
- */
-function argToParam(value: string) {
-	return value[0] === '-' ? value : value.match(/[^a-zA-Z0-9\-_]/) ? `"${value}"` : value;
-}
-
-const toString = (value: any) => `${value}`;
-const uid = (size = 6) => Math.random().toString().slice(-size);
-const getFilename = (path: string) => Path.basename(path, Path.extname(path));
-
-function getExtension(path: string) {
-	const extname = Path.extname(path).trim().slice(1).toLocaleLowerCase();
-	return extname === 'jpeg' ? 'jpg' : extname;
-}
-
-/**
- * FFmpeg std parser that extracts progress and logs the rest.
- */
-function ffmpegProgressOrLog(progress: Progress, log: (message: string) => void) {
-	let recentOutput = '';
-	let duration = 0;
-	let durationWontHappen = false;
-
-	return (message: string) => {
-		// Keep track of recent output, as some messages that need to be parsed
-		// sometimes arrive in separate std events.
-		recentOutput = (recentOutput + message).slice(-1000);
-
-		// Take over progress reports
-		const trimmedMessage = message.trim();
-		if (trimmedMessage.startsWith('frame=') || trimmedMessage.startsWith('size=')) {
-			durationWontHappen = true;
-
-			if (duration) {
-				const timeMatch = /time=([\d\:\.]+)/.exec(message)?.[1];
-
-				if (timeMatch) {
-					const milliseconds = humanTimeToMS(timeMatch);
-					if (milliseconds <= duration) progress(milliseconds, duration);
-				}
-			}
-
-			return;
-		}
-
-		// Attempt to extract duration if it wasn't yet, and we are still expecting it
-		if (!duration && !durationWontHappen) {
-			const durationMatch = /^ *Duration: *([\d\:\.]+),/m.exec(recentOutput)?.[1];
-			if (durationMatch) duration = humanTimeToMS(durationMatch) || 0;
-		}
-
-		log?.(message);
-	};
-}
-
-/**
- * '1:30:40.500' => {milliseconds}
- */
-export function humanTimeToMS(text: string) {
-	const split = text.split('.') as [string, string | undefined];
-	let time = split[1] ? parseFloat(`.${split[1]}`) * 1000 : 0;
-	const parts = split[0]
-		.split(':')
-		.filter((x) => x)
-		.map((x) => parseInt(x, 10));
-
-	if (parts.length > 0) time += parts.pop()! * 1000; // s
-	if (parts.length > 0) time += parts.pop()! * 1000 * 60; // m
-	if (parts.length > 0) time += parts.pop()! * 1000 * 60 * 60; // h
-
-	return time;
 }
 
 export interface TwoPassData {
