@@ -1,13 +1,16 @@
 {
 	"name": "@drovp/upscale",
 	"version": "3.0.0",
-	"description": "Upscale images and videos with waifu2x neural network.",
+	"description": "Upscale images and videos with Real-ESRGAN or waifu2x neural network.",
 	"main": "dist/index.js",
 	"keywords": [
 		"drovpplugin",
 		"image",
 		"video",
 		"upscale",
+		"esrgan",
+		"realesrgan",
+		"real-esrgan",
 		"waifu2x"
 	],
 	"author": "tomasklaen",
@@ -36,12 +39,13 @@
 	"dependencies": {
 		"@drovp/save-as-path": "^3.1.0",
 		"@drovp/types": "^4.11.0",
-		"ffprobe-normalized": "^2.2.3"
+		"ffprobe-normalized": "^2.2.4"
 	},
 	"devDependencies": {
+		"@types/node": "^18.11.9",
 		"npm-run-all": "^4.1.5",
 		"rimraf": "^3.0.2",
-		"tslib": "^2.4.0",
-		"typescript": "^4.7.4"
+		"tslib": "^2.4.1",
+		"typescript": "^4.9.3"
 	}
 }
