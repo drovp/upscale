@@ -48,6 +48,7 @@ function makeLoader(id: string, binaryName: string) {
 
 interface InstallerMeta {
 	repositoryId: string;
+	binName: string;
 	lookupLimit?: number;
 	isWrappedDir?: boolean; // Wether archive contains files wrapped in a single directory
 }
@@ -68,15 +69,15 @@ function makeInstaller(id: string, meta: InstallerMeta) {
 /**
  * Usage:
  * ```
- * await installRelease('realesrgan', 'windows', utils);
- * await installRelease('realesrgan', 'macos', utils);
- * await installRelease('realesrgan', 'ubuntu|linux', utils);
+ * await installRelease('realesrgan', 'windows', meta, utils);
+ * await installRelease('realesrgan', 'macos', meta, utils);
+ * await installRelease('realesrgan', 'ubuntu|linux', meta, utils);
  * ```
  */
 async function installRelease(
 	id: string,
 	archiveSuffix: string,
-	{repositoryId, lookupLimit = 10, isWrappedDir}: InstallerMeta,
+	{repositoryId, binName, lookupLimit = 10, isWrappedDir}: InstallerMeta,
 	{dataPath, tmpPath, download, extract, fetchJson, cleanup, progress, stage, log}: InstallUtils
 ) {
 	const dependencyDirectory = Path.join(dataPath, id);
@@ -173,6 +174,11 @@ async function installRelease(
 		log(`→ ${file.isDirectory() ? ' [dir]' : '[file]'}: ${file.name}`);
 		await FSP.rename(fromPath, toPath);
 	}
+
+	stage(`ensuring binaries are executable`);
+	const binPath = Path.join(dependencyDirectory, binName);
+	log(`marking as executable: ${binPath}`);
+	await FSP.chmod(binPath, 0o755);
 
 	/**
 	 * We need to write down the version manually, because the binary has no
@@ -905,14 +911,20 @@ const acceptsFlags = makeAcceptsFlags<Options>()({
 export type Payload = PayloadData<Options, typeof acceptsFlags>;
 
 export default (plugin: Plugin) => {
+	const waifu2xBinName = `waifu2x-ncnn-vulkan${process.platform === 'win32' ? '.exe' : ''}`;
 	plugin.registerDependency('waifu2x', {
-		load: makeLoader('waifu2x', `waifu2x-ncnn-vulkan${process.platform === 'win32' ? '.exe' : ''}`),
-		install: makeInstaller('waifu2x', {repositoryId: 'nihui/waifu2x-ncnn-vulkan', isWrappedDir: true}),
+		load: makeLoader('waifu2x', waifu2xBinName),
+		install: makeInstaller('waifu2x', {
+			repositoryId: 'nihui/waifu2x-ncnn-vulkan',
+			binName: waifu2xBinName,
+			isWrappedDir: true,
+		}),
 	});
 
+	const esrganBinName = `realesrgan-ncnn-vulkan${process.platform === 'win32' ? '.exe' : ''}`;
 	plugin.registerDependency('realesrgan', {
-		load: makeLoader('realesrgan', `realesrgan-ncnn-vulkan${process.platform === 'win32' ? '.exe' : ''}`),
-		install: makeInstaller('realesrgan', {repositoryId: 'xinntao/Real-ESRGAN'}),
+		load: makeLoader('realesrgan', esrganBinName),
+		install: makeInstaller('realesrgan', {repositoryId: 'xinntao/Real-ESRGAN', binName: esrganBinName}),
 	});
 
 	plugin.registerProcessor<Payload>('upscale', {
